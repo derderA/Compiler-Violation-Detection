@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GitLab 仓库违规审核工具</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero card">
+        <div class="hero-badge">GitLab 审核工作台</div>
+        <h1>GitLab 仓库违规审核工具</h1>
+        <p class="hero-lead">
+          输入仓库链接和分支后，系统会自动拉取代码、执行程序化扫描，并结合
+          <code>违规说明.md</code> 与 DeepSeek 生成审核报告。
+        </p>
+        <div class="hero-points">
+          <div class="hero-point">
+            <strong>自动拉取</strong>
+            <span>支持公开仓库和带 Token 的私有仓库</span>
+          </div>
+          <div class="hero-point">
+            <strong>扫描分析</strong>
+            <span>先做规则扫描，再汇总生成完整审核结论</span>
+          </div>
+          <div class="hero-point">
+            <strong>结果下载</strong>
+            <span>支持下载 Markdown 报告和摘要值文件</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>新建审核任务</h2>
+            <p class="muted">提交后会在当前页面展示审核状态、报告正文和摘要值。</p>
+          </div>
+        </div>
+        <form id="audit-form" class="audit-form">
+          <label>
+            <span>GitLab 仓库链接</span>
+            <input
+              id="repo-url"
+              name="repoUrl"
+              type="url"
+              placeholder="https://gitlab.com/group/project.git"
+              required
+            />
+          </label>
+
+          <label>
+            <span>分支名</span>
+            <input
+              id="branch"
+              name="branch"
+              type="text"
+              value="main"
+              placeholder="main"
+              required
+            />
+          </label>
+
+          <label>
+            <span>GitLab Token（可选，私有仓库时填写）</span>
+            <input
+              id="gitlab-token"
+              name="gitlabToken"
+              type="password"
+              placeholder="glpat-..."
+            />
+          </label>
+
+          <div class="actions">
+            <button id="submit-btn" type="submit">开始审核</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="status-card" class="card hidden">
+        <div class="section-heading">
+          <div>
+            <h2>执行状态</h2>
+            <p class="muted">任务开始后，这里会显示当前进展。</p>
+          </div>
+          <span class="status-dot" aria-hidden="true"></span>
+        </div>
+        <p id="status-text" class="status-text">等待提交</p>
+      </section>
+
+      <section id="result-card" class="card hidden">
+        <div class="result-header">
+          <div>
+            <h2>审核结果</h2>
+            <p id="result-meta" class="muted"></p>
+          </div>
+          <div class="download-actions">
+            <a id="download-report" class="download-link" href="#" download>下载 Markdown 报告</a>
+            <a id="download-hash" class="download-link" href="#" download>下载摘要文件</a>
+          </div>
+        </div>
+
+        <div class="result-layout">
+          <div class="result-side">
+            <div class="summary-grid">
+              <div class="summary-card">
+                <span class="summary-label">审核编号</span>
+                <strong id="summary-audit-id">-</strong>
+              </div>
+              <div class="summary-card">
+                <span class="summary-label">分支</span>
+                <strong id="summary-branch">-</strong>
+              </div>
+              <div class="summary-card summary-card-wide">
+                <span class="summary-label">仓库地址</span>
+                <strong id="summary-repo-url">-</strong>
+              </div>
+            </div>
+
+            <div class="hash-box">
+              <div class="box-header">
+                <h3>报告摘要</h3>
+                <button id="copy-hash" class="ghost-button" type="button">复制</button>
+              </div>
+              <code id="hash-value"></code>
+            </div>
+          </div>
+
+          <div class="report-box">
+            <div class="box-header">
+              <h3>Markdown 预览</h3>
+              <span class="muted">可直接滚动查看完整内容</span>
+            </div>
+            <pre id="report-preview"></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
