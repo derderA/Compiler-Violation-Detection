@@ -52,6 +52,10 @@ const REPORTS_DIR = path.join(__dirname, "reports");
 const WORKSPACE_DIR = path.join(__dirname, "workspace");
 const RULES_PATH = "违规说明.md";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
+const HMAC_SECRET = process.env.HMAC_SECRET ?? "";
+const ADMIN_PASSWORD_INITIAL = process.env.ADMIN_PASSWORD ?? "";
+const ADMIN_TOKEN_TTL_MS = 8 * 60 * 60 * 1000;
+const DB_PATH = path.join(__dirname, "data", "db.json");
 
 const TEXT_FILE_EXTENSIONS = new Set([
   ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hh",
@@ -160,6 +164,107 @@ function sanitizeAuditId(value) {
     throw new Error("非法的 auditId");
   }
   return value;
+}
+
+function hmacDigestHex(content) {
+  return crypto.createHmac("sha256", HMAC_SECRET).update(content).digest("hex");
+}
+
+function safeEqual(left, right) {
+  const a = Buffer.from(String(left));
+  const b = Buffer.from(String(right));
+  if (a.length !== b.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(a, b);
+}
+
+function signAdminToken() {
+  const payload = { sub: "admin", exp: Date.now() + ADMIN_TOKEN_TTL_MS };
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", `admin-token:${HMAC_SECRET}`)
+    .update(body)
+    .digest("base64url");
+  return `${body}.${signature}`;
+}
+
+function verifyAdminToken(token) {
+  if (typeof token !== "string" || !token.includes(".")) {
+    return false;
+  }
+
+  const separatorIndex = token.lastIndexOf(".");
+  const body = token.slice(0, separatorIndex);
+  const signature = token.slice(separatorIndex + 1);
+  const expected = crypto
+    .createHmac("sha256", `admin-token:${HMAC_SECRET}`)
+    .update(body)
+    .digest("base64url");
+
+  if (!safeEqual(signature, expected)) {
+    return false;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf-8"));
+    return payload.sub === "admin" && typeof payload.exp === "number" && payload.exp > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function readBearerToken(request) {
+  const authorization = String(request.headers.authorization ?? "");
+  if (!authorization.startsWith("Bearer ")) {
+    return "";
+  }
+  return authorization.slice("Bearer ".length).trim();
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16)) {
+  const hash = crypto.scryptSync(password, salt, 64);
+  return { salt: salt.toString("hex"), hash: hash.toString("hex") };
+}
+
+function verifyPassword(password, saltHex, hashHex) {
+  const salt = Buffer.from(saltHex, "hex");
+  const expected = Buffer.from(hashHex, "hex");
+  const actual = crypto.scryptSync(password, salt, 64);
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+async function readDb() {
+  try {
+    const raw = await fsp.readFile(DB_PATH, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function writeDb(db) {
+  await fsp.mkdir(path.dirname(DB_PATH), { recursive: true });
+  await fsp.writeFile(DB_PATH, JSON.stringify(db, null, 2), "utf-8");
+}
+
+async function ensureAdminInitialized() {
+  const db = await readDb();
+  if (db?.admin?.salt && db?.admin?.passwordHash) {
+    return { created: false };
+  }
+
+  const initial = ADMIN_PASSWORD_INITIAL || "admin123";
+  const { salt, hash } = hashPassword(initial);
+  await writeDb({
+    ...(db ?? {}),
+    admin: {
+      salt,
+      passwordHash: hash,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  return { created: true, usedDefault: !ADMIN_PASSWORD_INITIAL };
 }
 
 async function runCommand(command, args, options = {}) {
@@ -479,7 +584,7 @@ function buildFinalReport({ repoUrl, branch, auditId, rulesPath, scanResult, aiM
     "## 说明",
     "",
     "- 本报告先进行程序化扫描，再将规则、仓库摘要和重点代码交给 DeepSeek 生成审核结论。",
-    "- 哈希值针对本 Markdown 报告全文计算，可用于后续校验报告是否被篡改。",
+    "- 摘要值使用 HMAC-SHA256（密钥由服务端保管）对报告全文计算，可在管理员验证界面校验报告是否被篡改。",
     "",
   ].join("\n");
 }
@@ -559,8 +664,7 @@ async function handleAudit(request, response) {
       aiMarkdown,
     });
 
-    const reportHash = crypto.createHash("sha256").update(reportMarkdown, "utf-8").digest();
-    const reportHashHex = reportHash.toString("hex");
+    const reportHashHex = hmacDigestHex(reportMarkdown);
 
     await writeAuditArtifacts({
       auditId,
@@ -572,6 +676,7 @@ async function handleAudit(request, response) {
         branch,
         generatedAt: new Date().toISOString(),
         findings: scanResult.findings.length,
+        digestAlgorithm: "HMAC-SHA256",
       },
     });
 
@@ -581,6 +686,7 @@ async function handleAudit(request, response) {
       branch,
       reportMarkdown,
       reportHashHex,
+      digestAlgorithm: "HMAC-SHA256",
       reportDownloadUrl: `/api/download/${auditId}/analysis.md`,
       hashDownloadUrl: `/api/download/${auditId}/hash.txt`,
     });
@@ -615,6 +721,101 @@ async function handleDownload(requestPath, response) {
   }
 }
 
+async function handleAdminLogin(request, response) {
+  const body = await parseJsonBody(request);
+  const password = String(body.password ?? "");
+  const db = await readDb();
+  const admin = db?.admin;
+
+  if (!admin || !verifyPassword(password, admin.salt, admin.passwordHash)) {
+    json(response, 401, { error: "密码错误" });
+    return;
+  }
+
+  json(response, 200, {
+    token: signAdminToken(),
+    expiresInMs: ADMIN_TOKEN_TTL_MS,
+  });
+}
+
+async function handleAdminChangePassword(request, response) {
+  if (!verifyAdminToken(readBearerToken(request))) {
+    json(response, 401, { error: "未登录或登录已过期，请重新登录" });
+    return;
+  }
+
+  const body = await parseJsonBody(request);
+  const currentPassword = String(body.currentPassword ?? "");
+  const newPassword = String(body.newPassword ?? "");
+
+  if (newPassword.length < 6) {
+    json(response, 400, { error: "新密码长度至少 6 位" });
+    return;
+  }
+
+  const db = await readDb();
+  const admin = db?.admin;
+  if (!admin || !verifyPassword(currentPassword, admin.salt, admin.passwordHash)) {
+    json(response, 401, { error: "当前密码错误" });
+    return;
+  }
+
+  const { salt, hash } = hashPassword(newPassword);
+  admin.salt = salt;
+  admin.passwordHash = hash;
+  admin.updatedAt = new Date().toISOString();
+  await writeDb(db);
+
+  json(response, 200, { ok: true, message: "密码已更新" });
+}
+
+async function handleAdminVerify(request, response) {
+  if (!verifyAdminToken(readBearerToken(request))) {
+    json(response, 401, { error: "未登录或登录已过期，请重新登录" });
+    return;
+  }
+
+  const body = await parseJsonBody(request);
+  const digest = String(body.digest ?? "").trim().toLowerCase();
+  const contentBase64 = String(body.contentBase64 ?? "");
+  const fileName = String(body.fileName ?? "").trim();
+
+  if (!/^[a-f0-9]{64}$/.test(digest)) {
+    json(response, 400, { error: "摘要值格式不正确，应为 64 位十六进制字符串" });
+    return;
+  }
+
+  if (!contentBase64) {
+    json(response, 400, { error: "请先上传需要验证的文件" });
+    return;
+  }
+
+  let content;
+  try {
+    content = Buffer.from(contentBase64, "base64");
+  } catch {
+    json(response, 400, { error: "文件内容解析失败" });
+    return;
+  }
+
+  if (content.length === 0 || content.length > 5 * 1024 * 1024) {
+    json(response, 400, { error: "文件为空或超过 5MB 限制" });
+    return;
+  }
+
+  const computedDigest = hmacDigestHex(content);
+  const consistent = safeEqual(computedDigest, digest);
+
+  json(response, 200, {
+    fileName,
+    consistent,
+    message: consistent ? "一致" : "不一致",
+    computedDigest,
+    providedDigest: digest,
+    digestAlgorithm: "HMAC-SHA256",
+  });
+}
+
 const server = http.createServer(async (request, response) => {
   try {
     const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
@@ -626,6 +827,21 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && requestUrl.pathname === "/api/audit") {
       await handleAudit(request, response);
+      return;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/admin/login") {
+      await handleAdminLogin(request, response);
+      return;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/admin/change-password") {
+      await handleAdminChangePassword(request, response);
+      return;
+    }
+
+    if (request.method === "POST" && requestUrl.pathname === "/api/admin/verify") {
+      await handleAdminVerify(request, response);
       return;
     }
 
@@ -647,10 +863,24 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-server.listen(PORT, HOST, async () => {
-  await Promise.all([
-    fsp.mkdir(REPORTS_DIR, { recursive: true }),
-    fsp.mkdir(WORKSPACE_DIR, { recursive: true }),
-  ]);
+if (!HMAC_SECRET) {
+  console.error("缺少 HMAC_SECRET，请在 .env 中配置用于防篡改摘要和登录令牌的密钥。");
+  process.exit(1);
+}
+
+await fsp.mkdir(REPORTS_DIR, { recursive: true });
+await fsp.mkdir(WORKSPACE_DIR, { recursive: true });
+await fsp.mkdir(path.dirname(DB_PATH), { recursive: true });
+
+const adminInit = await ensureAdminInitialized();
+if (adminInit.created) {
+  if (adminInit.usedDefault) {
+    console.warn("【注意】未配置 ADMIN_PASSWORD，已使用默认初始密码 admin123，请登录管理界面后尽快修改。");
+  } else {
+    console.log("已根据 ADMIN_PASSWORD 初始化管理员密码。");
+  }
+}
+
+server.listen(PORT, HOST, () => {
   console.log(`GitLab 违规审核工具已启动：http://${HOST}:${PORT}`);
 });

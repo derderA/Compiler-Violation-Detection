@@ -2,4 +2,5 @@
 .claude/
 reports/
 workspace/
+data/
 *.log
