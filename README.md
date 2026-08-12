@@ -29,32 +29,41 @@ gitlab-violation-auditor/
 
 ## 环境变量
 
-至少需要配置：
+项目启动时会自动读取根目录下的 `.env` 文件，因此**需要用户自行创建** `/home/derder/gitlab-violation-auditor/.env`。
+
+可以参考下面的内容：
 
 ```bash
-export DEEPSEEK_API_KEY="你的 deepseek key"
+DEEPSEEK_API_KEY=your_deepseek_api_key
+PORT=3000
+HOST=0.0.0.0
+DEEPSEEK_BASE_URL=https://api.deepseek.com
 ```
 
-可选：
+其中：
 
-```bash
-export PORT=3000
-export HOST=0.0.0.0
-export DEEPSEEK_BASE_URL="https://api.deepseek.com"
-```
+- `DEEPSEEK_API_KEY`：必填，你自己的 DeepSeek API Key
+- `PORT`：可选，服务监听端口，默认 `3000`
+- `HOST`：可选，服务监听地址，默认 `0.0.0.0`
+- `DEEPSEEK_BASE_URL`：可选，默认 `https://api.deepseek.com`
 
 ## 启动方式
 
 ```bash
 cd /home/derder/gitlab-violation-auditor
-node server.js
+npm start
 ```
 
-或者：
+如果你还没有创建 `.env`，可以先执行：
 
 ```bash
 cd /home/derder/gitlab-violation-auditor
-npm start
+cat > .env <<'EOF'
+DEEPSEEK_API_KEY=your_deepseek_api_key
+PORT=3000
+HOST=0.0.0.0
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+EOF
 ```
 
 启动后访问：
