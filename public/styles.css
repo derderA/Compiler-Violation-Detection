@@ -494,3 +494,63 @@ input[type="file"] {
     grid-template-columns: 1fr;
   }
 }
+
+/* 页面导航 */
+.page-nav {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.nav-link {
+  padding: 10px 18px;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(15, 23, 42, 0.6);
+  color: #cbd5e1;
+  text-decoration: none;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.nav-link:hover {
+  color: #f8fafc;
+  border-color: rgba(56, 189, 248, 0.4);
+}
+
+.nav-link.active {
+  background: linear-gradient(135deg, #38bdf8, #8b5cf6);
+  color: #ffffff;
+  border-color: transparent;
+}
+
+/* 登录弹窗 */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 20px;
+}
+
+.modal {
+  width: min(420px, 100%);
+  background: #0f172a;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 18px;
+  padding: 24px;
+  box-shadow: 0 24px 80px rgba(15, 23, 42, 0.6);
+}
+
+.modal h2 {
+  margin: 0 0 6px;
+  color: #f8fafc;
+}
+
+.modal .muted {
+  margin: 0 0 18px;
+}

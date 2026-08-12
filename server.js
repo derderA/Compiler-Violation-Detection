@@ -53,7 +53,7 @@ const WORKSPACE_DIR = path.join(__dirname, "workspace");
 const RULES_PATH = "违规说明.md";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
 const HMAC_SECRET = process.env.HMAC_SECRET ?? "";
-const ADMIN_PASSWORD_INITIAL = process.env.ADMIN_PASSWORD ?? "";
+const DEFAULT_ADMIN_PASSWORD = "admin123";
 const ADMIN_TOKEN_TTL_MS = 8 * 60 * 60 * 1000;
 const DB_PATH = path.join(__dirname, "data", "db.json");
 
@@ -251,20 +251,24 @@ async function writeDb(db) {
 async function ensureAdminInitialized() {
   const db = await readDb();
   if (db?.admin?.salt && db?.admin?.passwordHash) {
+    if (typeof db.admin.mustChangePassword !== "boolean") {
+      db.admin.mustChangePassword = true;
+      await writeDb(db);
+    }
     return { created: false };
   }
 
-  const initial = ADMIN_PASSWORD_INITIAL || "admin123";
-  const { salt, hash } = hashPassword(initial);
+  const { salt, hash } = hashPassword(DEFAULT_ADMIN_PASSWORD);
   await writeDb({
     ...(db ?? {}),
     admin: {
       salt,
       passwordHash: hash,
+      mustChangePassword: true,
       updatedAt: new Date().toISOString(),
     },
   });
-  return { created: true, usedDefault: !ADMIN_PASSWORD_INITIAL };
+  return { created: true };
 }
 
 async function runCommand(command, args, options = {}) {
@@ -735,6 +739,7 @@ async function handleAdminLogin(request, response) {
   json(response, 200, {
     token: signAdminToken(),
     expiresInMs: ADMIN_TOKEN_TTL_MS,
+    mustChangePassword: admin.mustChangePassword === true,
   });
 }
 
@@ -763,6 +768,7 @@ async function handleAdminChangePassword(request, response) {
   const { salt, hash } = hashPassword(newPassword);
   admin.salt = salt;
   admin.passwordHash = hash;
+  admin.mustChangePassword = false;
   admin.updatedAt = new Date().toISOString();
   await writeDb(db);
 
@@ -772,6 +778,12 @@ async function handleAdminChangePassword(request, response) {
 async function handleAdminVerify(request, response) {
   if (!verifyAdminToken(readBearerToken(request))) {
     json(response, 401, { error: "未登录或登录已过期，请重新登录" });
+    return;
+  }
+
+  const db = await readDb();
+  if (db?.admin?.mustChangePassword) {
+    json(response, 403, { error: "请先修改初始密码后再进行验证" });
     return;
   }
 
@@ -874,11 +886,7 @@ await fsp.mkdir(path.dirname(DB_PATH), { recursive: true });
 
 const adminInit = await ensureAdminInitialized();
 if (adminInit.created) {
-  if (adminInit.usedDefault) {
-    console.warn("【注意】未配置 ADMIN_PASSWORD，已使用默认初始密码 admin123，请登录管理界面后尽快修改。");
-  } else {
-    console.log("已根据 ADMIN_PASSWORD 初始化管理员密码。");
-  }
+  console.warn("【注意】管理员初始密码为 admin123，首次登录后将强制要求修改。");
 }
 
 server.listen(PORT, HOST, () => {

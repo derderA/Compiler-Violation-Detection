@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>验证报告 · GitLab 仓库违规审核工具</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <nav class="page-nav">
+        <a href="/" class="nav-link">报告生成</a>
+        <a href="/verify.html" class="nav-link active">验证报告</a>
+        <a href="/password.html" class="nav-link">修改密码</a>
+      </nav>
+
+      <section class="hero card">
+        <div class="hero-badge">管理员工作台</div>
+        <h1>验证报告</h1>
+        <p class="hero-lead">
+          上传原始文件并输入文件处理后的摘要值，系统会重新计算 HMAC-SHA256 防篡改摘要并比对是否一致。仅管理员可操作。
+        </p>
+      </section>
+
+      <section class="card">
+        <div class="section-heading">
+          <div>
+            <h2>文件验证</h2>
+            <p class="muted">上传文件并粘贴摘要值，验证文件是否被篡改。</p>
+          </div>
+          <button id="verify-logout" class="ghost-button" type="button">退出登录</button>
+        </div>
+        <form id="verify-form" class="admin-form">
+          <label>
+            <span>上传原始文件</span>
+            <input id="verify-file" type="file" required />
+          </label>
+          <label>
+            <span>文件处理后的数据（摘要值）</span>
+            <input id="verify-digest" type="text" placeholder="64 位十六进制摘要值" required />
+          </label>
+          <div class="actions">
+            <button type="submit" id="verify-btn">开始验证</button>
+          </div>
+        </form>
+        <div id="verify-result" class="verify-result hidden"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/verify.js"></script>
+  </body>
+</html>

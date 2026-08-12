@@ -8,6 +8,12 @@
   </head>
   <body>
     <main class="page">
+      <nav class="page-nav">
+        <a href="/" class="nav-link active">报告生成</a>
+        <a href="/verify.html" class="nav-link">验证报告</a>
+        <a href="/password.html" class="nav-link">修改密码</a>
+      </nav>
+
       <section class="hero card">
         <div class="hero-badge">GitLab 审核工作台</div>
         <h1>GitLab 仓库违规审核工具</h1>
@@ -137,70 +143,6 @@
         </div>
       </section>
 
-      <section class="card" id="admin-card">
-        <div class="section-heading">
-          <div>
-            <h2>管理员验证</h2>
-            <p class="muted">
-              上传原始文件并输入文件处理后的摘要值，系统会重新计算 HMAC-SHA256 防篡改摘要并比对是否一致。仅管理员可操作。
-            </p>
-          </div>
-        </div>
-
-        <div id="admin-login-panel">
-          <form id="admin-login-form" class="admin-form login-form">
-            <label>
-              <span>管理员密码</span>
-              <input id="admin-password" type="password" autocomplete="current-password" required />
-            </label>
-            <div class="actions">
-              <button type="submit">登录</button>
-            </div>
-          </form>
-          <p id="admin-login-status" class="status-text hidden"></p>
-        </div>
-
-        <div id="admin-verify-panel" class="hidden">
-          <form id="admin-verify-form" class="admin-form">
-            <label>
-              <span>上传原始文件</span>
-              <input id="verify-file" type="file" required />
-            </label>
-            <label>
-              <span>文件处理后的数据（摘要值）</span>
-              <input id="verify-digest" type="text" placeholder="64 位十六进制摘要值" required />
-            </label>
-            <div class="actions">
-              <button type="submit" id="verify-btn">开始验证</button>
-              <button type="button" id="admin-logout" class="ghost-button">退出登录</button>
-            </div>
-          </form>
-          <div id="verify-result" class="verify-result hidden"></div>
-
-          <hr class="divider" />
-
-          <div class="section-heading">
-            <div>
-              <h3>修改密码</h3>
-              <p class="muted">修改成功后需要重新登录。</p>
-            </div>
-          </div>
-          <form id="change-password-form" class="admin-form">
-            <label>
-              <span>当前密码</span>
-              <input id="current-password" type="password" autocomplete="current-password" required />
-            </label>
-            <label>
-              <span>新密码（至少 6 位）</span>
-              <input id="new-password" type="password" autocomplete="new-password" required />
-            </label>
-            <div class="actions">
-              <button type="submit" id="change-password-btn">确认修改</button>
-            </div>
-          </form>
-          <p id="change-password-status" class="status-text hidden"></p>
-        </div>
-      </section>
     </main>
 
     <script type="module" src="/app.js"></script>
