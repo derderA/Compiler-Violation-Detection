@@ -4,7 +4,7 @@
 
 1. 在前端输入 GitLab 仓库链接和分支名
 2. 后端拉取对应仓库
-3. 读取 `/home/derder/update_compiler/违规说明.md`
+3. 读取 `违规说明.md`
 4. 结合程序化扫描结果，调用 DeepSeek API 对仓库进行违规审核
 5. 生成 Markdown 审核报告
 6. 对报告生成摘要值，并在前端展示和下载
@@ -30,7 +30,7 @@ gitlab-violation-auditor/
 
 ## 环境变量
 
-项目启动时会自动读取根目录下的 `.env` 文件，因此**需要用户自行创建** `/home/derder/gitlab-violation-auditor/.env`。
+项目启动时会自动读取根目录下的 `.env` 文件，因此**需要用户自行创建** `.env`。
 
 可以参考下面的内容：
 
@@ -55,14 +55,12 @@ ADMIN_PASSWORD=admin123
 ## 启动方式
 
 ```bash
-cd /home/derder/gitlab-violation-auditor
 npm start
 ```
 
 如果你还没有创建 `.env`，可以先执行：
 
 ```bash
-cd /home/derder/gitlab-violation-auditor
 cat > .env <<'EOF'
 DEEPSEEK_API_KEY=your_deepseek_api_key
 PORT=3000
