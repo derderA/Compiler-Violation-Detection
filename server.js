@@ -52,6 +52,12 @@ const REPORTS_DIR = path.join(__dirname, "reports");
 const WORKSPACE_DIR = path.join(__dirname, "workspace");
 const RULES_PATH = "违规说明.md";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com";
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL ?? "deepseek-v4-pro";
+const DEEPSEEK_MAX_INPUT_TOKENS = Number(process.env.DEEPSEEK_MAX_INPUT_TOKENS ?? 300000);
+const DEEPSEEK_MAX_OUTPUT_TOKENS = Number(process.env.DEEPSEEK_MAX_OUTPUT_TOKENS ?? 65536);
+const DEEPSEEK_TIMEOUT_MS = Number(process.env.DEEPSEEK_TIMEOUT_MS ?? 600000);
+const FILE_HEAD_LINES = 40;
+const DOC_HEAD_LINES = 150;
 const HMAC_SECRET = process.env.HMAC_SECRET ?? "";
 const DEFAULT_ADMIN_PASSWORD = "admin123";
 const ADMIN_TOKEN_TTL_MS = 8 * 60 * 60 * 1000;
@@ -69,29 +75,6 @@ const IGNORED_DIR_NAMES = new Set([
   ".git", "node_modules", "build", "dist", "target", "out",
   ".idea", ".vscode", "__pycache__", ".next", ".nuxt"
 ]);
-
-const SUSPICIOUS_PATTERNS = [
-  {
-    name: "命中特定样例名或测试点标识",
-    rule: "违规说明 §三.1/§三.2/§三.3",
-    regex: /\b(01_mm[123]?|h-4-0[123]|huffman-0[123]|transpose[012]|knapsack_naive-[123]|mm[123]?|transpose|knapsack|huffman)\b/gi,
-  },
-  {
-    name: "出现函数名或字符串匹配痕迹",
-    rule: "违规说明 §三.1",
-    regex: /\b(strcmp|strstr|find\s*\(|includes\s*\(|GetName|getName|function_name|func_name|callee_name)\b/g,
-  },
-  {
-    name: "出现输入模式判断痕迹",
-    rule: "违规说明 §三.3/§三.5",
-    regex: /\b(getint|getarray|scanf|fscanf|cin|argv|argc|read)\b.{0,80}(==|!=|<=|>=|<|>)/g,
-  },
-  {
-    name: "出现大量硬编码候选常量",
-    rule: "违规说明 §三.2/§三.5",
-    regex: /\b(2000|1000|998244353|65535|4096|1024)\b/g,
-  },
-];
 
 function json(response, statusCode, payload) {
   response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
@@ -350,6 +333,16 @@ function isTextFile(fileName) {
   return TEXT_FILE_EXTENSIONS.has(path.extname(fileName).toLowerCase()) || path.basename(fileName) === "CMakeLists.txt";
 }
 
+function isDocumentationFile(relativePath) {
+  const base = path.basename(relativePath).toLowerCase();
+  const dir = path.dirname(relativePath);
+  if (dir !== "." && dir !== "/" && dir !== "") {
+    return false;
+  }
+  return /(readme|design|report|doc|spec|说明|设计|文档|报告|项目|介绍|优化)/.test(base) ||
+    /\.(md|txt|rst)$/.test(base);
+}
+
 async function walkFiles(rootDir, currentDir = rootDir, results = []) {
   const entries = await fsp.readdir(currentDir, { withFileTypes: true });
   for (const entry of entries) {
@@ -369,145 +362,317 @@ async function walkFiles(rootDir, currentDir = rootDir, results = []) {
   return results;
 }
 
-function buildSnippet(lines, hitLineIndex, radius = 3) {
-  const start = Math.max(0, hitLineIndex - radius);
-  const end = Math.min(lines.length, hitLineIndex + radius + 1);
-  const snippet = [];
-  for (let i = start; i < end; i += 1) {
-    snippet.push(`${String(i + 1).padStart(4, " ")} | ${lines[i]}`);
-  }
-  return snippet.join("\n");
-}
-
-async function scanRepository(repoDir) {
+async function collectRepository(repoDir) {
   const allFiles = await walkFiles(repoDir);
   const textFiles = allFiles.filter((file) => isTextFile(file.relativePath));
 
-  const findings = [];
-  const fileSummaries = [];
-
+  const files = [];
   for (const file of textFiles) {
-    const stat = await fsp.stat(file.absolutePath);
-    if (stat.size > 200 * 1024) {
+    let stat;
+    try {
+      stat = await fsp.stat(file.absolutePath);
+    } catch {
       continue;
     }
 
-    const content = await fsp.readFile(file.absolutePath, "utf-8");
-    const lines = content.split(/\r?\n/);
-    fileSummaries.push({
-      path: file.relativePath,
+    let lines = 0;
+    let head = "";
+    try {
+      const content = await fsp.readFile(file.absolutePath, "utf-8");
+      const fileLines = content.split(/\r?\n/);
+      lines = fileLines.length;
+      const headLimit = isDocumentationFile(file.relativePath) ? DOC_HEAD_LINES : FILE_HEAD_LINES;
+      head = fileLines.slice(0, headLimit).join("\n");
+    } catch {
+      // 无法按文本读取的文件仅记录元信息，不参与后续分析
+    }
+
+    files.push({
+      absolutePath: file.absolutePath,
+      relativePath: file.relativePath,
       size: stat.size,
-      lines: lines.length,
+      lines,
+      head,
     });
-
-    for (const pattern of SUSPICIOUS_PATTERNS) {
-      const fileRegex = new RegExp(pattern.regex.source, pattern.regex.flags);
-      let lineIndex = 0;
-      for (const line of lines) {
-        fileRegex.lastIndex = 0;
-        if (fileRegex.test(line)) {
-          findings.push({
-            file: file.relativePath,
-            line: lineIndex + 1,
-            pattern: pattern.name,
-            rule: pattern.rule,
-            snippet: buildSnippet(lines, lineIndex),
-          });
-        }
-        lineIndex += 1;
-      }
-    }
-  }
-
-  const topFindings = findings.slice(0, 18);
-  const suspiciousPaths = [...new Set(topFindings.map((item) => item.file))];
-  const selectedFiles = [];
-  let totalChars = 0;
-
-  for (const relativePath of suspiciousPaths) {
-    const absolutePath = path.join(repoDir, relativePath);
-    const content = await fsp.readFile(absolutePath, "utf-8");
-    const trimmed = content.slice(0, 10000);
-    if (totalChars + trimmed.length > 60000) {
-      break;
-    }
-    selectedFiles.push({ path: relativePath, content: trimmed });
-    totalChars += trimmed.length;
-  }
-
-  if (selectedFiles.length === 0) {
-    for (const file of fileSummaries.slice(0, 6)) {
-      const absolutePath = path.join(repoDir, file.path);
-      const content = await fsp.readFile(absolutePath, "utf-8");
-      const trimmed = content.slice(0, 8000);
-      if (totalChars + trimmed.length > 60000) {
-        break;
-      }
-      selectedFiles.push({ path: file.path, content: trimmed });
-      totalChars += trimmed.length;
-    }
   }
 
   return {
     fileCount: allFiles.length,
-    textFileCount: fileSummaries.length,
-    fileSummaries: fileSummaries.slice(0, 200),
-    findings: topFindings,
-    selectedFiles,
+    textFileCount: files.length,
+    files,
   };
 }
 
-function formatFindingsMarkdown(findings) {
-  if (findings.length === 0) {
-    return "- 未发现明显的程序化命中线索，但这不代表仓库一定合规，仍需结合 DeepSeek 审核结果判断。";
-  }
-
-  return findings.map((finding, index) => (
-    `${index + 1}. ${finding.pattern}（${finding.rule}）\n` +
-    `   - 文件：\`${finding.file}\`\n` +
-    `   - 代码片段：\n\n` +
-    "```text\n" +
-    `${finding.snippet}\n` +
-    "```"
-  )).join("\n\n");
+function estimateTokens(text) {
+  // 保守估算：代码多为 ASCII，规则/说明含中文，取约 1 token / 3 字符
+  return Math.ceil(String(text ?? "").length / 3);
 }
 
-function buildPrompt({ repoUrl, branch, rulesMarkdown, scanResult }) {
-  const fileSummaryText = scanResult.fileSummaries
-    .slice(0, 80)
-    .map((file) => `- ${file.path} (${file.lines} 行, ${file.size} bytes)`)
-    .join("\n");
+function extractJson(text) {
+  if (!text) {
+    return null;
+  }
+  let source = String(text).trim();
+  const fence = source.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) {
+    source = fence[1].trim();
+  }
 
-  const findingsText = scanResult.findings.length === 0
-    ? "没有程序化扫描到明显嫌疑点。"
-    : scanResult.findings.map((finding, index) => (
-        `${index + 1}. [${finding.rule}] ${finding.pattern}\n` +
-        `文件: ${finding.file}:${finding.line}\n` +
-        `${finding.snippet}`
-      )).join("\n\n");
+  const closers = { "{": "}", "[": "]" };
+  let openIndex = -1;
+  let openChar = "";
+  for (const ch of ["{", "["]) {
+    const idx = source.indexOf(ch);
+    if (idx !== -1 && (openIndex === -1 || idx < openIndex)) {
+      openIndex = idx;
+      openChar = ch;
+    }
+  }
+  if (openIndex === -1) {
+    return null;
+  }
 
-  const fileContexts = scanResult.selectedFiles
-    .map((file) => (
-      `文件: ${file.path}\n` +
-      "```text\n" +
-      `${file.content}\n` +
-      "```"
-    ))
+  const closeChar = closers[openChar];
+  const closeIndex = source.lastIndexOf(closeChar);
+  if (closeIndex === -1 || closeIndex <= openIndex) {
+    return null;
+  }
+  try {
+    return JSON.parse(source.slice(openIndex, closeIndex + 1));
+  } catch {
+    return null;
+  }
+}
+
+function buildFileManifest(files, budgetTokens = DEEPSEEK_MAX_INPUT_TOKENS) {
+  const docFiles = files.filter((file) => isDocumentationFile(file.relativePath));
+  const otherFiles = files.filter((file) => !isDocumentationFile(file.relativePath));
+  const ordered = [...docFiles, ...otherFiles];
+
+  for (const headLines of [40, 20, 10, 5, 1]) {
+    const entries = [];
+    let used = 0;
+    for (const file of ordered) {
+      const isDoc = isDocumentationFile(file.relativePath);
+      // 文档文件用完整存储的 head（较长），其余文件按当前档位截断
+      const head = isDoc
+        ? file.head
+        : (headLines === 1 ? "" : file.head.split(/\r?\n/).slice(0, headLines).join("\n"));
+      const label = isDoc ? "【项目文档】" : "";
+      const entry = `- ${label}${file.relativePath} (${file.lines} 行, ${file.size} bytes)${head ? "\n" + head : ""}`;
+      const cost = estimateTokens(entry);
+      if (used + cost > budgetTokens) {
+        break;
+      }
+      entries.push(entry);
+      used += cost;
+    }
+    if (entries.length > 0) {
+      return entries.join("\n\n");
+    }
+  }
+  return ordered.slice(0, 200).map((file) => `- ${file.relativePath} (${file.lines} 行)`).join("\n");
+}
+
+async function readPassSources(pass, files, budgetTokens = DEEPSEEK_MAX_INPUT_TOKENS) {
+  const fileMap = new Map(files.map((file) => [file.relativePath, file]));
+  const referenced = (pass.files ?? []).map((item) => String(item).trim()).filter(Boolean);
+  const sources = [];
+  let used = 0;
+
+  for (const relativePath of referenced) {
+    const meta = fileMap.get(relativePath);
+    if (!meta) {
+      continue;
+    }
+
+    let content = "";
+    try {
+      content = await fsp.readFile(meta.absolutePath, "utf-8");
+    } catch {
+      continue;
+    }
+
+    const contentTokens = estimateTokens(content);
+    const remaining = budgetTokens - used;
+    if (remaining <= 0) {
+      break;
+    }
+
+    let truncated = false;
+    if (contentTokens > remaining) {
+      content = content.slice(0, Math.floor(remaining * 3));
+      truncated = true;
+    }
+
+    sources.push({ path: relativePath, content, truncated });
+    used += estimateTokens(content);
+  }
+
+  return sources;
+}
+
+const SYSY_RUNTIME_NOTE = [
+  "【审核口径补充：关于 SysY 标准运行时库 sylib】",
+  "SysY 语言有标准运行时库（sylib），其 I/O 与计时函数如 putint、putch、putfloat、putarray、putfarray、getint、getch、getfloat、getarray、getfarray、_sysy_starttime、_sysy_stoptime、starttime、stoptime 等是语言标准定义的库函数。",
+  "编译器识别这些「标准运行时库函数」以判断其是否无副作用/纯，从而安全地进行 Mem2Reg、别名分析、死代码消除等优化，属于通用优化，不构成违规。",
+  "只有识别「具体测试用例特有」的函数名、字符串、输入大小/内容等特征（如特定样例名、测试点标识、特定用户函数）来做针对性优化，才属于违规。",
+].join("\n");
+
+const STATIC_CONDITION_NOTE = [
+  "【审核口径补充：编译期结构条件 vs 运行时输入特判】",
+  "1. 编译期静态结构条件（如循环边界/trip count 为编译期常量、满足某种指令或基本块结构、函数无副作用等）是通用优化的正常前提，属于合理性优化，不违规；",
+  "2. 运行时输入特判（根据实际读入数据的大小/内容/字符串在运行时激活特定优化路径、硬编码某个具体测试用例的结果）才属于 §三.2/§三.3 的违规。",
+  "循环展开按固定因子展开、并要求边界为编译期常量且可被因子整除（否则跳过），属于灰色地带的通用优化，一般判「合规」，除非有明显证据表明其针对特定测试用例的数值做了调优。",
+].join("\n");
+
+const HARDWARE_NOTE = [
+  "【审核口径补充：目标硬件特性 vs 竞赛测试规模】",
+  "编译器针对目标处理器（如 ARM Cortex-A53）的缓存大小/缓存行/路数、寄存器数量、流水线、指令集等硬件特性设置的常量或参数（如循环分块的块大小、避免缓存冲突的 2^k+1 型常量、指令调度窗口等），属于《违规说明》§二『利用处理器硬件通用特性』的合理优化，不违规。",
+  "判断一个常量是否违规，关键看它对应的是目标硬件的通用参数还是测试用例的输入规模：对应硬件参数（如 257=256+1 这种避免 cache 冲突的取值）应判合理；只有当常量明显对应特定测试用例的输入规模/数值时才判违规。即使注释中出现『竞赛/测试』字眼，只要数值本质是硬件参数，也应判合理。",
+].join("\n");
+
+function buildMapPrompt({ repoUrl, branch, manifest }) {
+  return [
+    "你是编译器工程结构分析助手。下面是一个编译器项目的文件清单，其中标注【项目文档】的是项目说明/设计/报告类文档，其余是源码文件（含每个文件开头若干行）。",
+    "",
+    "你的任务是完整识别出该编译器实现的所有『优化 / 代码变换 / 特判』pass，不要遗漏。请按以下步骤分析：",
+    "",
+    "1. 优先阅读【项目文档】——项目主目录或 docs/ 下通常有说明文档（README、设计文档、报告、说明等，命名可能各异），其中常会列出优化流水线与各 pass；把它当作权威参考，据此对照源码确认 pass。",
+    "2. 结合目录结构定位 pass 代码——源码里通常有集中放置优化逻辑的目录或文件，但命名不固定（可能是 pass/passes/opt/transform/optimization/midend/优化 等目录，也可能是 PassManager/PassRegistry 之类的调度文件，或文件名含 Pass/Opt/Optimize 的文件）；请结合调度文件和文档自行判断，不要假设固定目录名。",
+    "3. 逐个枚举所有优化 pass，包括但不限于：函数内联、循环变换（展开/交换/合并/不变量外提/向量化/归纳变量削减）、常量折叠与传播、死代码消除、公共子表达式消除、函数克隆/特化、Mem2Reg/SSA、寄存器分配、CFG 简化，以及任何『根据函数名/字符串/输入特征做特判』或『硬编码结果』的逻辑。",
+    "",
+    "要求：",
+    "- 力求完整，宁可多列也不要漏掉常见 pass；",
+    "- 每个 pass 必须在 files 字段里给出其对应的源文件相对路径（不要留空），functions 列出关键函数名；",
+    "- 忽略纯前端、词法/语法分析、类型检查、代码生成等管道逻辑，除非其中夹带了优化/特判。",
+    "",
+    `仓库地址：${repoUrl}`,
+    `分支：${branch}`,
+    "",
+    "【文件清单】",
+    manifest,
+    "",
+    "请只输出一个合法 JSON 对象（不要 Markdown 代码围栏、不要额外说明），结构如下：",
+    JSON.stringify({
+      passes: [
+        {
+          name: "pass 名称",
+          purpose: "一句话目的",
+          files: ["相对路径"],
+          functions: ["函数名"],
+          confidence: "high|medium|low",
+        },
+      ],
+      nonPassFiles: ["非 pass 相关文件路径"],
+      notes: "补充说明",
+    }, null, 2),
+    "",
+    "若没有识别到优化 pass，请输出 { \"passes\": [], \"nonPassFiles\": [], \"notes\": \"...\" }。",
+  ].join("\n");
+}
+
+function estimatePassTokens(item) {
+  const text = (item.sources ?? []).map((source) => source.content).join("\n");
+  return estimateTokens(text) + estimateTokens(item.pass.name ?? "") + 60;
+}
+
+function packPassesIntoBatches(items, budgetTokens) {
+  const batches = [];
+  let current = [];
+  let used = 0;
+  for (const item of items) {
+    const cost = estimatePassTokens(item);
+    if (current.length > 0 && used + cost > budgetTokens) {
+      batches.push(current);
+      current = [];
+      used = 0;
+    }
+    current.push(item);
+    used += cost;
+  }
+  if (current.length > 0) {
+    batches.push(current);
+  }
+  return batches;
+}
+
+function buildPassBatchPrompt({ batch, rulesMarkdown, batchIndex, batchCount }) {
+  const sourceText = batch
+    .map((item, index) => {
+      const pass = item.pass;
+      const sources = item.sources ?? [];
+      const src = sources
+        .map((source) => {
+          const note = source.truncated
+            ? `\n（该文件过大，已截断，仅展示前 ${source.content.length} 字符）`
+            : "";
+          return `文件: ${source.path}\n\`\`\`text\n${source.content}\n\`\`\`${note}`;
+        })
+        .join("\n\n");
+      return [
+        `### 第 ${index + 1} 个 pass：${pass.name ?? "未知"}`,
+        `目的：${pass.purpose ?? "未知"}`,
+        `涉及函数：${(pass.functions ?? []).join(", ") || "未知"}`,
+        "",
+        src || "（未找到该 pass 引用的文件，无法分析）",
+      ].join("\n");
+    })
     .join("\n\n");
 
   return [
-    "你是编译器比赛违规审核助手，请严格按照给定规则审核 GitLab 仓库。",
-    "审核时必须遵守：",
-    "1. 只能依据提供的规则和代码证据判断，不要凭空猜测。",
-    "2. 区分“明确违规证据”“高风险可疑点”“暂未发现证据”。",
-    "3. 如果证据不足，不要下定罪结论，要明确写“建议人工复核”。",
-    "4. 输出必须是 Markdown，且必须包含以下章节：",
-    "   - 审核结论",
-    "   - 风险等级",
-    "   - 触犯或疑似触犯的规则条款",
-    "   - 证据分析",
-    "   - 是否建议人工复核",
-    "   - 审核建议",
+    "你是编译器比赛违规审核助手。下面给出了多个优化 pass 的源代码，请逐个分析其原理并判定是否违规。",
+    "",
+    "审核原则：",
+    "1. 只依据提供的规则与代码证据判断，不要凭空猜测；",
+    "2. 区分『明确违规』『高风险可疑』『合规（通用优化）』；",
+    "3. 关键判据：该 pass 是否依赖特定测试用例的特征（函数名、字符串、输入大小/内容等）来激活特定优化路径，而非通用优化；",
+    "4. 证据不足时判『疑似违规』，不要下定罪结论；",
+    "5. 每个 pass 的 principle 和 reasoning 请尽量简洁（各 2~4 句话），确保所有 pass 都能被完整输出。",
+    "",
+    `（共 ${batchCount} 批，本批为第 ${batchIndex + 1} 批）`,
+    "",
+    "【违规说明原文】",
+    rulesMarkdown,
+    "",
+    "【审核口径补充】",
+    SYSY_RUNTIME_NOTE,
+    "",
+    STATIC_CONDITION_NOTE,
+    "",
+    HARDWARE_NOTE,
+    "",
+    "【待分析的多个 pass】",
+    sourceText,
+    "",
+    "请只输出一个 JSON 数组（不要 Markdown 代码围栏），数组元素顺序与上面 pass 顺序一一对应，每个元素结构如下：",
+    JSON.stringify({
+      passName: "pass 名称",
+      principle: "该 pass 的优化原理（一段话）",
+      verdict: "合规 | 疑似违规 | 违规",
+      ruleClauses: ["§三.1", "§三.3"],
+      evidence: [
+        { file: "相对路径", line: 12, code: "关键代码行", reason: "为什么可疑" },
+      ],
+      confidence: "high|medium|low",
+      reasoning: "判定理由",
+    }, null, 2),
+  ].join("\n");
+}
+
+function buildSynthesisPrompt({ repoUrl, branch, passResults, rulesMarkdown }) {
+  const compact = passResults
+    .map((passResult) => {
+      if (passResult.error) {
+        return `- ${passResult.passName ?? "未知"}：判定=分析失败，原因=${passResult.error}`;
+      }
+      const clauses = (passResult.ruleClauses ?? []).join("、") || "无";
+      return `- ${passResult.passName ?? "未知"}：判定=${passResult.verdict ?? "未知"}，置信度=${passResult.confidence ?? "unknown"}，规则=${clauses}，理由=${passResult.reasoning ?? ""}`;
+    })
+    .join("\n");
+
+  return [
+    "你是编译器比赛违规审核助手。以下是逐个优化 pass 的分析结论，请据此输出整份仓库的总体审核结论。",
     "",
     `仓库地址：${repoUrl}`,
     `分支：${branch}`,
@@ -515,20 +680,28 @@ function buildPrompt({ repoUrl, branch, rulesMarkdown, scanResult }) {
     "【违规说明原文】",
     rulesMarkdown,
     "",
-    "【仓库文件概览】",
-    fileSummaryText || "- 无",
+    "【审核口径补充】",
+    SYSY_RUNTIME_NOTE,
     "",
-    "【程序化扫描线索】",
-    findingsText,
+    STATIC_CONDITION_NOTE,
     "",
-    "【重点文件内容】",
-    fileContexts || "无可用重点文件内容。",
+    HARDWARE_NOTE,
     "",
-    "请直接输出 Markdown 报告正文，不要额外输出 JSON。",
+    "【各 pass 分析结论】",
+    compact || "- 无",
+    "",
+    "请输出 Markdown 正文，必须包含以下章节：",
+    "- 审核结论",
+    "- 风险等级（高/中/低）",
+    "- 触犯或疑似触犯的规则条款",
+    "- 是否建议人工复核",
+    "- 审核建议",
+    "",
+    "只输出 Markdown 正文，不要输出 JSON。",
   ].join("\n");
 }
 
-async function callDeepSeek({ apiKey, prompt }) {
+async function callDeepSeek({ apiKey, prompt, system = "你是严谨的代码审计助手，只能依据给定规则和证据输出分析结果。", timeoutMs = DEEPSEEK_TIMEOUT_MS }) {
   const response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
@@ -536,20 +709,15 @@ async function callDeepSeek({ apiKey, prompt }) {
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: "deepseek-chat",
+      model: DEEPSEEK_MODEL,
       temperature: 0.1,
+      max_tokens: DEEPSEEK_MAX_OUTPUT_TOKENS,
       messages: [
-        {
-          role: "system",
-          content: "你是严谨的代码审计助手，只能依据给定规则和证据输出 Markdown 审核报告。",
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
+        { role: "system", content: system },
+        { role: "user", content: prompt },
       ],
     }),
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!response.ok) {
@@ -561,7 +729,66 @@ async function callDeepSeek({ apiKey, prompt }) {
   return data.choices?.[0]?.message?.content?.trim() ?? "DeepSeek 未返回有效内容。";
 }
 
-function buildFinalReport({ repoUrl, branch, auditId, rulesPath, scanResult, aiMarkdown }) {
+async function callDeepSeekJson({ apiKey, prompt, system, timeoutMs }) {
+  const first = await callDeepSeek({ apiKey, prompt, system, timeoutMs });
+  const parsed = extractJson(first);
+  if (parsed) {
+    return parsed;
+  }
+
+  const retryPrompt = `${prompt}\n\n注意：请务必只输出一个合法 JSON 对象，不要包含 Markdown 代码围栏或任何额外说明文字。`;
+  const second = await callDeepSeek({ apiKey, prompt: retryPrompt, system, timeoutMs });
+  const retryParsed = extractJson(second);
+  if (retryParsed) {
+    return retryParsed;
+  }
+
+  throw new Error("DeepSeek 未返回可解析的 JSON");
+}
+
+function formatPassSection(passResult, index) {
+  if (passResult.error) {
+    return [
+      `### Pass ${index + 1}：${passResult.passName ?? "未知"}`,
+      "",
+      "- 判定：分析失败",
+      "",
+      `- 原因：${passResult.error}`,
+      "",
+    ].join("\n");
+  }
+
+  const lines = [
+    `### Pass ${index + 1}：${passResult.passName ?? "未知"}`,
+    "",
+    `- 判定：**${passResult.verdict ?? "未知"}**（置信度：${passResult.confidence ?? "unknown"}）`,
+    `- 对应规则条款：${(passResult.ruleClauses ?? []).join("、") || "无"}`,
+    "",
+    "#### 原理",
+    "",
+    passResult.principle ?? "（无）",
+    "",
+    "#### 证据",
+    "",
+  ];
+
+  if ((passResult.evidence ?? []).length === 0) {
+    lines.push("- 无明确证据行", "");
+  } else {
+    for (const ev of passResult.evidence) {
+      lines.push(`- \`${ev.file}\` 第 ${ev.line} 行`, "", "```text", ev.code ?? "", "```", "", `  - ${ev.reason ?? ""}`, "");
+    }
+  }
+
+  lines.push("#### 判定理由", "", passResult.reasoning ?? "（无）", "");
+  return lines.join("\n");
+}
+
+function buildFinalReport({ repoUrl, branch, auditId, rulesPath, collectResult, passResults, synthesisMarkdown }) {
+  const passSections = passResults.map(formatPassSection).join("\n");
+  const violationCount = passResults.filter((passResult) => passResult.verdict === "违规").length;
+  const suspectCount = passResults.filter((passResult) => passResult.verdict === "疑似违规").length;
+
   return [
     "# GitLab 仓库违规审核报告",
     "",
@@ -571,23 +798,25 @@ function buildFinalReport({ repoUrl, branch, auditId, rulesPath, scanResult, aiM
     `- 规则来源：\`${rulesPath}\``,
     `- 审核时间：${new Date().toLocaleString("zh-CN", { hour12: false })}`,
     "",
-    "## 程序化扫描概览",
+    "## 扫描概览",
     "",
-    `- 扫描文件总数：${scanResult.fileCount}`,
-    `- 文本/代码文件数：${scanResult.textFileCount}`,
-    `- 程序化线索数：${scanResult.findings.length}`,
+    `- 扫描文件总数：${collectResult.fileCount}`,
+    `- 文本/代码文件数：${collectResult.textFileCount}`,
+    `- 识别到的优化 pass 数：${passResults.length}`,
+    `- 判定为「违规」的 pass 数：${violationCount}`,
+    `- 判定为「疑似违规」的 pass 数：${suspectCount}`,
     "",
-    "## 程序化扫描线索",
+    "## 各优化 Pass 分析",
     "",
-    formatFindingsMarkdown(scanResult.findings),
+    passSections || "- 未识别到优化 pass。",
     "",
-    "## DeepSeek 审核结论",
+    "## 汇总结论",
     "",
-    aiMarkdown,
+    synthesisMarkdown,
     "",
     "## 说明",
     "",
-    "- 本报告先进行程序化扫描，再将规则、仓库摘要和重点代码交给 DeepSeek 生成审核结论。",
+    "- 本报告由 DeepSeek 分阶段通读仓库全部代码、逐 pass 分析生成：先定位优化 pass，再逐个读取其完整源码判断原理与合规性，最后汇总。",
     "- 摘要值使用 HMAC-SHA256（密钥由服务端保管）对报告全文计算，可在管理员验证界面校验报告是否被篡改。",
     "",
   ].join("\n");
@@ -651,21 +880,80 @@ async function handleAudit(request, response) {
   try {
     const sanitizedRepoUrl = stripCredentials(repoUrl);
     await cloneRepository({ repoUrl, branch, gitlabToken, destination: repoDir });
-    const scanResult = await scanRepository(repoDir);
-    const prompt = buildPrompt({
-      repoUrl: sanitizedRepoUrl,
-      branch,
-      rulesMarkdown,
-      scanResult,
-    });
-    const aiMarkdown = await callDeepSeek({ apiKey, prompt });
+    const collectResult = await collectRepository(repoDir);
+
+    // Map：依据文件清单识别优化 pass
+    const manifest = buildFileManifest(collectResult.files);
+    const mapPrompt = buildMapPrompt({ repoUrl: sanitizedRepoUrl, branch, manifest });
+    const mapResult = await callDeepSeekJson({ apiKey, prompt: mapPrompt });
+    const passes = Array.isArray(mapResult?.passes) ? mapResult.passes : [];
+
+    // Reduce：读取所有 pass 源码，按 token 预算分批，每批一次调用分析多个 pass
+    const passItems = [];
+    for (const pass of passes) {
+      const sources = await readPassSources(pass, collectResult.files);
+      passItems.push({ pass, sources });
+    }
+
+    const batchBudget = Math.max(8000, DEEPSEEK_MAX_INPUT_TOKENS - 8000);
+    const batches = packPassesIntoBatches(passItems, batchBudget);
+    const passResults = [];
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+      const batch = batches[batchIndex];
+      try {
+        const passPrompt = buildPassBatchPrompt({
+          batch,
+          rulesMarkdown,
+          batchIndex,
+          batchCount: batches.length,
+        });
+        const result = await callDeepSeekJson({ apiKey, prompt: passPrompt });
+        const array = Array.isArray(result) ? result : [];
+        for (let i = 0; i < batch.length; i += 1) {
+          const item = array[i];
+          if (item) {
+            passResults.push(item);
+          } else {
+            passResults.push({
+              passName: batch[i].pass.name ?? "未知",
+              error: "该批分析未返回对应结果",
+            });
+          }
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "分析失败";
+        for (const item of batch) {
+          passResults.push({ passName: item.pass.name ?? "未知", error: message });
+        }
+      }
+    }
+
+    // Synthesize：汇总各 pass 结论
+    let synthesisMarkdown;
+    if (passes.length === 0) {
+      synthesisMarkdown = "未能从仓库中识别出优化 pass，无法进行逐 pass 分析。建议人工检查仓库结构。";
+    } else {
+      try {
+        const synthesisPrompt = buildSynthesisPrompt({
+          repoUrl: sanitizedRepoUrl,
+          branch,
+          passResults,
+          rulesMarkdown,
+        });
+        synthesisMarkdown = await callDeepSeek({ apiKey, prompt: synthesisPrompt });
+      } catch (error) {
+        synthesisMarkdown = `汇总失败：${error instanceof Error ? error.message : "未知错误"}`;
+      }
+    }
+
     const reportMarkdown = buildFinalReport({
       repoUrl: sanitizedRepoUrl,
       branch,
       auditId,
       rulesPath: RULES_PATH,
-      scanResult,
-      aiMarkdown,
+      collectResult,
+      passResults,
+      synthesisMarkdown,
     });
 
     const reportHashHex = hmacDigestHex(reportMarkdown);
@@ -679,7 +967,12 @@ async function handleAudit(request, response) {
         repoUrl: sanitizedRepoUrl,
         branch,
         generatedAt: new Date().toISOString(),
-        findings: scanResult.findings.length,
+        passCount: passResults.length,
+        verdicts: {
+          违规: passResults.filter((passResult) => passResult.verdict === "违规").length,
+          疑似违规: passResults.filter((passResult) => passResult.verdict === "疑似违规").length,
+          合规: passResults.filter((passResult) => passResult.verdict === "合规").length,
+        },
         digestAlgorithm: "HMAC-SHA256",
       },
     });
@@ -691,6 +984,7 @@ async function handleAudit(request, response) {
       reportMarkdown,
       reportHashHex,
       digestAlgorithm: "HMAC-SHA256",
+      passCount: passResults.length,
       reportDownloadUrl: `/api/download/${auditId}/analysis.md`,
       hashDownloadUrl: `/api/download/${auditId}/hash.txt`,
     });
