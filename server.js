@@ -474,39 +474,92 @@ function buildFileManifest(files, budgetTokens = DEEPSEEK_MAX_INPUT_TOKENS) {
   return ordered.slice(0, 200).map((file) => `- ${file.relativePath} (${file.lines} 行)`).join("\n");
 }
 
-async function readPassSources(pass, files, budgetTokens = DEEPSEEK_MAX_INPUT_TOKENS) {
+async function readFileContent(absolutePath) {
+  try {
+    return await fsp.readFile(absolutePath, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+function normalizeName(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// 定位 pass 的源文件并读取内容（四级兜底，尽量确保能定位到）
+async function locatePassSources(pass, files, budgetTokens = DEEPSEEK_MAX_INPUT_TOKENS) {
   const fileMap = new Map(files.map((file) => [file.relativePath, file]));
   const referenced = (pass.files ?? []).map((item) => String(item).trim()).filter(Boolean);
-  const sources = [];
-  let used = 0;
+  const name = normalizeName(pass.name);
+  const funcs = (pass.functions ?? []).map((item) => String(item).trim()).filter(Boolean);
 
+  const matched = [];
+  const seen = new Set();
+  const push = (file) => {
+    if (!seen.has(file.relativePath)) {
+      seen.add(file.relativePath);
+      matched.push(file);
+    }
+  };
+
+  // 1. LLM 给的 files 精确匹配
   for (const relativePath of referenced) {
     const meta = fileMap.get(relativePath);
-    if (!meta) {
-      continue;
-    }
+    if (meta) push(meta);
+  }
 
-    let content = "";
-    try {
-      content = await fsp.readFile(meta.absolutePath, "utf-8");
-    } catch {
-      continue;
+  // 2. 按 pass 名做路径模糊匹配（basename / 子串）
+  if (matched.length === 0 && name) {
+    for (const file of files) {
+      const rel = file.relativePath;
+      const relNorm = normalizeName(rel);
+      const baseNorm = normalizeName(path.basename(rel));
+      if (relNorm.includes(name) || baseNorm.includes(name)) {
+        push(file);
+      }
     }
+  }
+
+  // 3. 按 functions 去文件内容 grep
+  if (matched.length === 0 && funcs.length > 0) {
+    for (const file of files) {
+      const content = await readFileContent(file.absolutePath);
+      if (content && funcs.some((fn) => content.includes(fn))) {
+        push(file);
+      }
+    }
+  }
+
+  // 4. 按 pass 名去文件内容 grep
+  if (matched.length === 0 && name) {
+    for (const file of files) {
+      const content = await readFileContent(file.absolutePath);
+      if (content && normalizeName(content).includes(name)) {
+        push(file);
+      }
+    }
+  }
+
+  // 读取匹配到的文件内容，按预算截断
+  const sources = [];
+  let used = 0;
+  for (const file of matched) {
+    const content = await readFileContent(file.absolutePath);
+    if (!content) continue;
 
     const contentTokens = estimateTokens(content);
     const remaining = budgetTokens - used;
-    if (remaining <= 0) {
-      break;
-    }
+    if (remaining <= 0) break;
 
     let truncated = false;
+    let text = content;
     if (contentTokens > remaining) {
-      content = content.slice(0, Math.floor(remaining * 3));
+      text = content.slice(0, Math.floor(remaining * 3));
       truncated = true;
     }
 
-    sources.push({ path: relativePath, content, truncated });
-    used += estimateTokens(content);
+    sources.push({ path: file.relativePath, content: text, truncated });
+    used += estimateTokens(text);
   }
 
   return sources;
@@ -529,6 +582,7 @@ const STATIC_CONDITION_NOTE = [
 const HARDWARE_NOTE = [
   "【审核口径补充：目标硬件特性 vs 竞赛测试规模】",
   "编译器针对目标处理器（如 ARM Cortex-A53）的缓存大小/缓存行/路数、寄存器数量、流水线、指令集等硬件特性设置的常量或参数（如循环分块的块大小、避免缓存冲突的 2^k+1 型常量、指令调度窗口等），属于《违规说明》§二『利用处理器硬件通用特性』的合理优化，不违规。",
+  "利用处理器多核特性进行多线程/多核并行、以及 SIMD/NEON 向量化，同样属于『利用处理器硬件通用特性』的合理优化，不违规。",
   "判断一个常量是否违规，关键看它对应的是目标硬件的通用参数还是测试用例的输入规模：对应硬件参数（如 257=256+1 这种避免 cache 冲突的取值）应判合理；只有当常量明显对应特定测试用例的输入规模/数值时才判违规。即使注释中出现『竞赛/测试』字眼，只要数值本质是硬件参数，也应判合理。",
 ].join("\n");
 
@@ -544,7 +598,8 @@ function buildMapPrompt({ repoUrl, branch, manifest }) {
     "",
     "要求：",
     "- 力求完整，宁可多列也不要漏掉常见 pass；",
-    "- 每个 pass 必须在 files 字段里给出其对应的源文件相对路径（不要留空），functions 列出关键函数名；",
+    "- 每个 pass 的 files 字段必须从【文件清单】里逐字复制其相对路径（不要留空、不要省略目录、不要臆造路径）；若实现分散在多个文件，列出全部相关文件；",
+    "- functions 字段务必列出该 pass 的关键函数名/类名（用于精确定位源码），宁可多列；",
     "- 忽略纯前端、词法/语法分析、类型检查、代码生成等管道逻辑，除非其中夹带了优化/特判。",
     "",
     `仓库地址：${repoUrl}`,
@@ -784,10 +839,16 @@ function formatPassSection(passResult, index) {
   return lines.join("\n");
 }
 
-function buildFinalReport({ repoUrl, branch, auditId, rulesPath, collectResult, passResults, synthesisMarkdown }) {
+function buildFinalReport({ repoUrl, branch, auditId, rulesPath, collectResult, passResults, locatedFailures = [], synthesisMarkdown }) {
   const passSections = passResults.map(formatPassSection).join("\n");
   const violationCount = passResults.filter((passResult) => passResult.verdict === "违规").length;
   const suspectCount = passResults.filter((passResult) => passResult.verdict === "疑似违规").length;
+  const failureSections = locatedFailures
+    .map((item) => {
+      const funcs = (item.pass.functions ?? []).join(", ") || "无";
+      return `- \`${item.pass.name ?? "未知"}\`（涉及函数：${funcs}）`;
+    })
+    .join("\n");
 
   return [
     "# GitLab 仓库违规审核报告",
@@ -809,6 +870,10 @@ function buildFinalReport({ repoUrl, branch, auditId, rulesPath, collectResult, 
     "## 各优化 Pass 分析",
     "",
     passSections || "- 未识别到优化 pass。",
+    "",
+    "## 未能定位源码的 Pass",
+    "",
+    failureSections || "- 无（所有识别出的 pass 都成功定位到源码）",
     "",
     "## 汇总结论",
     "",
@@ -888,11 +953,16 @@ async function handleAudit(request, response) {
     const mapResult = await callDeepSeekJson({ apiKey, prompt: mapPrompt });
     const passes = Array.isArray(mapResult?.passes) ? mapResult.passes : [];
 
-    // Reduce：读取所有 pass 源码，按 token 预算分批，每批一次调用分析多个 pass
+    // Reduce：定位并读取每个 pass 的源码；定位失败的单独记录，不进入 DeepSeek 分析
     const passItems = [];
+    const locatedFailures = [];
     for (const pass of passes) {
-      const sources = await readPassSources(pass, collectResult.files);
-      passItems.push({ pass, sources });
+      const sources = await locatePassSources(pass, collectResult.files);
+      if (sources.length === 0) {
+        locatedFailures.push({ pass });
+      } else {
+        passItems.push({ pass, sources });
+      }
     }
 
     const batchBudget = Math.max(8000, DEEPSEEK_MAX_INPUT_TOKENS - 8000);
@@ -953,6 +1023,7 @@ async function handleAudit(request, response) {
       rulesPath: RULES_PATH,
       collectResult,
       passResults,
+      locatedFailures,
       synthesisMarkdown,
     });
 
